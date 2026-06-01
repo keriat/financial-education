@@ -1,13 +1,20 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import type { Session } from "@supabase/supabase-js";
 import { supabase, hasEnv } from "@/lib/supabase";
 import type { Kid, Action, Tx } from "@/lib/types";
+import Login from "./login";
 
 const ACCENTS = ["var(--eva)", "var(--serge)"];
 const fmt = (n: number) => new Intl.NumberFormat("ro-MD").format(Math.round(n));
 
+const MAX_EARN = 10000;
+const MAX_MOVE = 1_000_000;
+
 export default function Page() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [kids, setKids] = useState<Kid[]>([]);
   const [actions, setActions] = useState<Action[]>([]);
   const [rate, setRate] = useState(0.2);
@@ -15,6 +22,21 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [flashId, setFlashId] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  useEffect(() => {
+    if (!hasEnv) {
+      setAuthReady(true);
+      setLoading(false);
+      return;
+    }
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthReady(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
 
   const reload = useCallback(async () => {
     const [k, a, s, t] = await Promise.all([
@@ -36,30 +58,40 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
-    if (!hasEnv) {
+    if (!hasEnv || !session) {
       setLoading(false);
       return;
     }
     (async () => {
-      await supabase.rpc("apply_interest"); // догнать пропущенные понедельники
+      setLoading(true);
+      await supabase.rpc("apply_interest");
       await reload();
       setLoading(false);
     })();
-  }, [reload]);
+  }, [reload, session]);
+
+  if (!hasEnv) return <Setup />;
+  if (!authReady) return <div className="center"><p className="sub">Загрузка…</p></div>;
+  if (!session) return <Login />;
+  if (loading) return <div className="center"><p className="sub">Загрузка…</p></div>;
 
   const earn = async (kidId: string, a: Action) => {
     setFlashId(kidId);
     setTimeout(() => setFlashId(null), 500);
-    await supabase.rpc("earn", { p_kid: kidId, p_label: a.label, p_amount: a.amount });
+    const amount = Math.max(0, Math.min(MAX_EARN, Math.floor(a.amount)));
+    if (amount <= 0) return;
+    await supabase.rpc("earn", { p_kid: kidId, p_label: a.label, p_amount: amount });
     await reload();
   };
-  const toSavings = async (kidId: string, amt: number) => {
-    if (!amt || amt <= 0) return;
+  const toSavings = async (kidId: string, raw: number) => {
+    const amt = Math.max(0, Math.min(MAX_MOVE, Math.floor(raw || 0)));
+    if (amt <= 0) return;
     await supabase.rpc("to_savings", { p_kid: kidId, p_amount: amt });
     await reload();
   };
-  const fromSavings = async (kidId: string, amt: number) => {
-    if (!amt || amt <= 0) return;
+  const fromSavings = async (kidId: string, raw: number) => {
+    const amt = Math.max(0, Math.min(MAX_MOVE, Math.floor(raw || 0)));
+    if (amt <= 0) return;
     await supabase.rpc("from_savings", { p_kid: kidId, p_amount: amt });
     await reload();
   };
@@ -67,9 +99,6 @@ export default function Page() {
     await supabase.rpc("payout", { p_kid: kidId });
     await reload();
   };
-
-  if (!hasEnv) return <Setup />;
-  if (loading) return <div className="center"><p className="sub">Загрузка…</p></div>;
 
   return (
     <div className="wrap">
@@ -106,6 +135,21 @@ export default function Page() {
           rate={rate}
           reload={reload}
           close={() => setSettingsOpen(false)}
+          onReset={() => setConfirmReset(true)}
+        />
+      )}
+
+      {confirmReset && (
+        <ConfirmModal
+          title="Обнулить балансы и историю?"
+          body="Дети и список дел останутся. Транзакции и текущие суммы будут стёрты безвозвратно."
+          confirmLabel="Да, обнулить"
+          onCancel={() => setConfirmReset(false)}
+          onConfirm={async () => {
+            await supabase.rpc("reset_all");
+            setConfirmReset(false);
+            await reload();
+          }}
         />
       )}
     </div>
@@ -165,6 +209,7 @@ function KidCard({
             <div className="moneyrow">
               <input
                 className="num amt" type="number" inputMode="numeric" placeholder="сумма"
+                min={0} max={MAX_MOVE} step={1}
                 value={amt} onChange={(e) => setAmt(e.target.value)}
               />
               <button className="pill mbtn" style={{ background: "var(--gold)", color: "#fff" }}
@@ -193,32 +238,41 @@ function KidCard({
 }
 
 function Settings({
-  kids, actions, rate, reload, close,
+  kids, actions, rate, reload, close, onReset,
 }: {
-  kids: Kid[]; actions: Action[]; rate: number; reload: () => Promise<void>; close: () => void;
+  kids: Kid[]; actions: Action[]; rate: number; reload: () => Promise<void>; close: () => void; onReset: () => void;
 }) {
   const commit = async (fn: () => PromiseLike<unknown>) => { await fn(); await reload(); };
 
-  const updateRate = (pct: number) =>
-    commit(() => supabase.from("settings").update({ rate: pct / 100 }).eq("id", 1));
-  const renameKid = (id: string, name: string) =>
-    commit(() => supabase.from("kids").update({ name }).eq("id", id));
-  const correct = (id: string, field: "available" | "savings", val: number) =>
-    commit(() => supabase.from("kids").update({ [field]: val }).eq("id", id));
-  const updateAction = (id: string, patch: Partial<Action>) =>
-    commit(() => supabase.from("actions").update(patch).eq("id", id));
-  const addAction = () =>
-    commit(() => supabase.from("actions").insert({ label: "Новое дело", amount: 20, sort: actions.length }));
-  const delAction = (id: string) =>
-    commit(() => supabase.from("actions").delete().eq("id", id));
-
-  const reset = async () => {
-    if (!confirm("Обнулить все балансы и стереть историю? Дети и список дел останутся.")) return;
-    await supabase.from("transactions").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-    await Promise.all(kids.map((k) =>
-      supabase.from("kids").update({ available: 0, savings: 0, savings_anchor: null }).eq("id", k.id)));
-    await reload();
+  const updateRate = (pct: number) => {
+    const clamped = Math.max(0, Math.min(100, pct));
+    return commit(() => supabase.rpc("set_rate", { p_rate: clamped / 100 }));
   };
+  const renameKid = (id: string, name: string) => {
+    const n = name.trim().slice(0, 40);
+    if (!n) return Promise.resolve();
+    return commit(() => supabase.rpc("rename_kid", { p_kid: id, p_name: n }));
+  };
+  const correct = (id: string, available: number, savings: number) =>
+    commit(() => supabase.rpc("correct_kid", {
+      p_kid: id,
+      p_available: Math.max(0, Math.floor(available || 0)),
+      p_savings:   Math.max(0, Math.floor(savings   || 0)),
+    }));
+  const updateAction = (id: string, label: string, amount: number) =>
+    commit(() => supabase.rpc("update_action", {
+      p_id: id,
+      p_label: label.trim().slice(0, 80) || "Дело",
+      p_amount: Math.max(0, Math.min(MAX_EARN, Math.floor(amount || 0))),
+    }));
+  const addAction = () =>
+    commit(() => supabase.rpc("add_action", {
+      p_label: "Новое дело", p_amount: 20, p_sort: actions.length,
+    }));
+  const delAction = (id: string) =>
+    commit(() => supabase.rpc("delete_action", { p_id: id }));
+
+  const signOut = async () => { await supabase.auth.signOut(); };
 
   return (
     <div className="overlay" onClick={close}>
@@ -230,7 +284,8 @@ function Settings({
 
         <label className="flabel">Процент роста в неделю</label>
         <div className="frow">
-          <input className="num field" style={{ width: 100 }} type="number" defaultValue={Math.round(rate * 100)}
+          <input className="num field" style={{ width: 100 }} type="number" min={0} max={100} step={1}
+            defaultValue={Math.round(rate * 100)}
             onBlur={(e) => updateRate(Number(e.target.value) || 0)} />
           <span className="small">% — применяется к сумме «в росте» каждый понедельник</span>
         </div>
@@ -238,36 +293,83 @@ function Settings({
         <label className="flabel">Имена</label>
         {kids.map((k) => (
           <div className="frow" key={k.id}>
-            <input className="field" defaultValue={k.name} onBlur={(e) => renameKid(k.id, e.target.value)} />
+            <input className="field" maxLength={40} defaultValue={k.name}
+              onBlur={(e) => renameKid(k.id, e.target.value)} />
           </div>
         ))}
 
         <label className="flabel">За что начисляем</label>
         {actions.map((a) => (
-          <div className="frow" key={a.id}>
-            <input className="field" defaultValue={a.label} onBlur={(e) => updateAction(a.id, { label: e.target.value })} />
-            <input className="num field" style={{ width: 80, textAlign: "center" }} type="number" defaultValue={a.amount}
-              onBlur={(e) => updateAction(a.id, { amount: Number(e.target.value) || 0 })} />
-            <button className="delbtn" onClick={() => delAction(a.id)}>✕</button>
-          </div>
+          <ActionRow key={a.id} action={a} onSave={updateAction} onDelete={() => delAction(a.id)} />
         ))}
         <button className="addbtn" onClick={addAction}>+ добавить дело</button>
 
         <label className="flabel">Исправить вручную</label>
         {kids.map((k) => (
-          <div className="frow" key={k.id}>
-            <span style={{ width: 64, fontWeight: 800, fontSize: 14, opacity: 0.7 }}>{k.name}</span>
-            <span className="small">дост.</span>
-            <input className="num field" style={{ textAlign: "center" }} type="number" defaultValue={k.available}
-              onBlur={(e) => correct(k.id, "available", Number(e.target.value) || 0)} />
-            <span className="small">рост</span>
-            <input className="num field" style={{ textAlign: "center" }} type="number" defaultValue={k.savings}
-              onBlur={(e) => correct(k.id, "savings", Number(e.target.value) || 0)} />
-          </div>
+          <CorrectRow key={k.id} kid={k} onSave={correct} />
         ))}
 
         <button className="savebtn" onClick={close}>Готово</button>
-        <button className="resetbtn" onClick={reset}>Обнулить балансы и историю</button>
+        <button className="resetbtn" onClick={onReset}>Обнулить балансы и историю</button>
+        <button className="resetbtn" style={{ background: "transparent", color: "#9a9690" }} onClick={signOut}>
+          Выйти из аккаунта
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ActionRow({
+  action, onSave, onDelete,
+}: { action: Action; onSave: (id: string, label: string, amount: number) => void; onDelete: () => void }) {
+  const [label, setLabel] = useState(action.label);
+  const [amount, setAmount] = useState(action.amount);
+  return (
+    <div className="frow">
+      <input className="field" maxLength={80} value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onBlur={() => onSave(action.id, label, amount)} />
+      <input className="num field" style={{ width: 80, textAlign: "center" }} type="number" min={0} max={MAX_EARN}
+        value={amount}
+        onChange={(e) => setAmount(Number(e.target.value) || 0)}
+        onBlur={() => onSave(action.id, label, amount)} />
+      <button className="delbtn" onClick={onDelete}>✕</button>
+    </div>
+  );
+}
+
+function CorrectRow({
+  kid, onSave,
+}: { kid: Kid; onSave: (id: string, available: number, savings: number) => void }) {
+  const [available, setAvailable] = useState(kid.available);
+  const [savings, setSavings]   = useState(kid.savings);
+  return (
+    <div className="frow">
+      <span style={{ width: 64, fontWeight: 800, fontSize: 14, opacity: 0.7 }}>{kid.name}</span>
+      <span className="small">дост.</span>
+      <input className="num field" style={{ textAlign: "center" }} type="number" min={0}
+        value={available}
+        onChange={(e) => setAvailable(Number(e.target.value) || 0)}
+        onBlur={() => onSave(kid.id, available, savings)} />
+      <span className="small">рост</span>
+      <input className="num field" style={{ textAlign: "center" }} type="number" min={0}
+        value={savings}
+        onChange={(e) => setSavings(Number(e.target.value) || 0)}
+        onBlur={() => onSave(kid.id, available, savings)} />
+    </div>
+  );
+}
+
+function ConfirmModal({
+  title, body, confirmLabel, onConfirm, onCancel,
+}: { title: string; body: string; confirmLabel: string; onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="overlay" onClick={onCancel}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 360 }}>
+        <h2 className="display modaltitle" style={{ marginBottom: 8 }}>{title}</h2>
+        <p className="sub" style={{ marginBottom: 16 }}>{body}</p>
+        <button className="resetbtn" onClick={onConfirm}>{confirmLabel}</button>
+        <button className="savebtn" onClick={onCancel}>Отмена</button>
       </div>
     </div>
   );
