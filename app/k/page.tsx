@@ -23,20 +23,29 @@ type ViewData = {
   transactions: ViewTx[];
 };
 
+const TOKEN_KEY = "kopilka.kid.token";
+
 function KidPublic() {
   const params = useSearchParams();
-  const token = params.get("t");
   const [data, setData] = useState<ViewData | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
+    // Свежий токен из URL запоминаем — чтобы PWA, запущенный с домашнего
+    // экрана без `?t=`, читал последнее значение из localStorage.
+    let token = params.get("t");
+    try {
+      if (token) localStorage.setItem(TOKEN_KEY, token);
+      else token = localStorage.getItem(TOKEN_KEY);
+    } catch { /* приватный режим / запрет storage — ничего страшного */ }
+
     if (!hasEnv || !token) { setLoaded(true); return; }
     (async () => {
       const { data: res } = await supabase.rpc("kid_view", { p_token: token });
       if (res) setData(res as ViewData);
       setLoaded(true);
     })();
-  }, [token]);
+  }, [params]);
 
   if (!loaded) return <div className="center"><p className="sub">Загрузка…</p></div>;
   if (!data) return (
