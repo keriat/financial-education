@@ -3,8 +3,7 @@ export type Kid = {
   name: string;
   sort: number;
   available: number;
-  savings: number;
-  savings_anchor: string | null;
+  interest_anchor: string | null;
 };
 
 export type Action = {

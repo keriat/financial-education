@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase, hasEnv } from "@/lib/supabase";
 import type { Kid, Action, Tx } from "@/lib/types";
@@ -8,9 +8,23 @@ import Login from "./login";
 
 const ACCENTS = ["var(--eva)", "var(--serge)"];
 const fmt = (n: number) => new Intl.NumberFormat("ro-MD").format(Math.round(n));
+const fmtDate = (iso: string) =>
+  new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "2-digit" }).format(new Date(iso));
 
 const MAX_EARN = 10000;
-const MAX_MOVE = 1_000_000;
+
+const todayISO = () => {
+  const d = new Date();
+  const tz = d.getTimezoneOffset() * 60000;
+  return new Date(d.getTime() - tz).toISOString().slice(0, 10);
+};
+// `<input type="date">` returns YYYY-MM-DD in local time. Convert to a
+// timestamp: today → null (server uses now()); past dates → local noon ISO
+// so it lands unambiguously on that day regardless of TZ/DST.
+const whenFromPicker = (picked: string): string | null => {
+  if (!picked || picked === todayISO()) return null;
+  return new Date(`${picked}T12:00:00`).toISOString();
+};
 
 export default function Page() {
   const [session, setSession] = useState<Session | null>(null);
@@ -23,6 +37,7 @@ export default function Page() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [recordDate, setRecordDate] = useState<string>(todayISO());
 
   useEffect(() => {
     if (!hasEnv) {
@@ -70,6 +85,18 @@ export default function Page() {
     })();
   }, [reload, session]);
 
+  // Всего заработано = earn + interest по всей истории, на ребёнка.
+  // 300 транзакций — лимит окна; для семейного использования этого достаточно.
+  const earnedByKid = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const [kidId, txs] of Object.entries(txByKid)) {
+      let sum = 0;
+      for (const tx of txs) if (tx.type === "earn" || tx.type === "interest") sum += tx.amount;
+      out[kidId] = sum;
+    }
+    return out;
+  }, [txByKid]);
+
   if (!hasEnv) return <Setup />;
   if (!authReady) return <div className="center"><p className="sub">Загрузка…</p></div>;
   if (!session) return <Login />;
@@ -80,23 +107,20 @@ export default function Page() {
     setTimeout(() => setFlashId(null), 500);
     const amount = Math.max(0, Math.min(MAX_EARN, Math.floor(a.amount)));
     if (amount <= 0) return;
-    await supabase.rpc("earn", { p_kid: kidId, p_label: a.label, p_amount: amount });
+    await supabase.rpc("earn", {
+      p_kid: kidId, p_label: a.label, p_amount: amount,
+      p_when: whenFromPicker(recordDate),
+    });
     await reload();
   };
-  const toSavings = async (kidId: string, raw: number) => {
-    const amt = Math.max(0, Math.min(MAX_MOVE, Math.floor(raw || 0)));
+  const payout = async (kidId: string, raw: number, comment: string) => {
+    const amt = Math.max(0, Math.min(10_000_000, Math.floor(raw || 0)));
     if (amt <= 0) return;
-    await supabase.rpc("to_savings", { p_kid: kidId, p_amount: amt });
-    await reload();
-  };
-  const fromSavings = async (kidId: string, raw: number) => {
-    const amt = Math.max(0, Math.min(MAX_MOVE, Math.floor(raw || 0)));
-    if (amt <= 0) return;
-    await supabase.rpc("from_savings", { p_kid: kidId, p_amount: amt });
-    await reload();
-  };
-  const payout = async (kidId: string) => {
-    await supabase.rpc("payout", { p_kid: kidId });
+    await supabase.rpc("payout", {
+      p_kid: kidId, p_amount: amt,
+      p_label: comment.trim().slice(0, 80) || null,
+      p_when: whenFromPicker(recordDate),
+    });
     await reload();
   };
 
@@ -105,9 +129,24 @@ export default function Page() {
       <div className="topbar">
         <div>
           <h1 className="display h1">Копилка</h1>
-          <p className="sub">учёт леев · {Math.round(rate * 100)}% в неделю в росте</p>
+          <p className="sub">учёт леев · {Math.round(rate * 100)}% в неделю на счёт</p>
         </div>
         <button className="pill gearbtn card" onClick={() => setSettingsOpen(true)}>⚙︎ настройки</button>
+      </div>
+
+      <div className="card datebar">
+        <span className="small">Пишу за:</span>
+        <input
+          className="field"
+          type="date"
+          value={recordDate}
+          max={todayISO()}
+          onChange={(e) => setRecordDate(e.target.value || todayISO())}
+          style={{ width: 150 }}
+        />
+        {recordDate !== todayISO() && (
+          <button className="pill" onClick={() => setRecordDate(todayISO())}>сегодня</button>
+        )}
       </div>
 
       {kids.map((k, i) => (
@@ -118,15 +157,14 @@ export default function Page() {
           actions={actions}
           rate={rate}
           txs={txByKid[k.id] || []}
+          earned={earnedByKid[k.id] || 0}
           flash={flashId === k.id}
           onEarn={(a) => earn(k.id, a)}
-          onSave={(amt) => toSavings(k.id, amt)}
-          onUnsave={(amt) => fromSavings(k.id, amt)}
-          onPayout={() => payout(k.id)}
+          onPayout={(amt, comment) => payout(k.id, amt, comment)}
         />
       ))}
 
-      <p className="footer">Данные в Supabase · только плюсы — ничего не отнимается.</p>
+      <p className="footer">Данные в Supabase · проценты на счёт каждую неделю.</p>
 
       {settingsOpen && (
         <Settings
@@ -157,15 +195,15 @@ export default function Page() {
 }
 
 function KidCard({
-  kid, accent, actions, rate, txs, flash, onEarn, onSave, onUnsave, onPayout,
+  kid, accent, actions, rate, txs, earned, flash, onEarn, onPayout,
 }: {
-  kid: Kid; accent: string; actions: Action[]; rate: number; txs: Tx[]; flash: boolean;
-  onEarn: (a: Action) => void; onSave: (n: number) => void; onUnsave: (n: number) => void; onPayout: () => void;
+  kid: Kid; accent: string; actions: Action[]; rate: number; txs: Tx[]; earned: number; flash: boolean;
+  onEarn: (a: Action) => void; onPayout: (amount: number, comment: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [amt, setAmt] = useState("");
-  const total = kid.available + kid.savings;
-  const projected = Math.floor(kid.savings * rate);
+  const [payAmt, setPayAmt] = useState("");
+  const [payNote, setPayNote] = useState("");
+  const projected = Math.floor(kid.available * rate);
 
   const icon = (t: Tx["type"]) =>
     t === "interest" ? "💛 " : t === "payout" ? "💵 " : t === "save" ? "🔒 " : t === "unsave" ? "🔓 " : "⭐️ ";
@@ -176,18 +214,18 @@ function KidCard({
     <section className={`card kid ${flash ? "flash" : ""}`}>
       <div className="kidhead" style={{ background: accent }}>
         <span className="display kidname">{kid.name}</span>
-        <span className="num kidtotal">{fmt(total)} lei</span>
+        <span className="num kidtotal">{fmt(kid.available)} lei</span>
       </div>
 
       <div className="stats">
         <div className="stat">
-          <div className="statlabel">Доступно</div>
+          <div className="statlabel">На счету</div>
           <div className="num statval" style={{ color: "var(--green)" }}>{fmt(kid.available)}<span className="unit">lei</span></div>
+          {kid.available > 0 && <div className="proj">пн: +{fmt(projected)} lei</div>}
         </div>
         <div className="stat">
-          <div className="statlabel">В росте</div>
-          <div className="num statval" style={{ color: "var(--gold)" }}>{fmt(kid.savings)}<span className="unit">lei</span></div>
-          {kid.savings > 0 && <div className="proj">пн: +{fmt(projected)} lei</div>}
+          <div className="statlabel">Заработано</div>
+          <div className="num statval" style={{ color: "var(--gold)" }}>{fmt(earned)}<span className="unit">lei</span></div>
         </div>
       </div>
 
@@ -201,7 +239,7 @@ function KidCard({
 
       <div className="drawer">
         <button className="toggle" onClick={() => setOpen((o) => !o)}>
-          {open ? "▾ скрыть" : "▸ деньги и история"}
+          {open ? "▾ скрыть" : "▸ выдать и история"}
         </button>
 
         {open && (
@@ -209,21 +247,32 @@ function KidCard({
             <div className="moneyrow">
               <input
                 className="num amt" type="number" inputMode="numeric" placeholder="сумма"
-                min={0} max={MAX_MOVE} step={1}
-                value={amt} onChange={(e) => setAmt(e.target.value)}
+                min={0} max={kid.available} step={1}
+                value={payAmt} onChange={(e) => setPayAmt(e.target.value)}
               />
-              <button className="pill mbtn" style={{ background: "var(--gold)", color: "#fff" }}
-                onClick={() => { onSave(Number(amt) || 0); setAmt(""); }}>В рост →</button>
-              <button className="pill mbtn" style={{ background: "var(--gold-soft)", color: "var(--gold)" }}
-                onClick={() => { onUnsave(Number(amt) || 0); setAmt(""); }}>← Снять</button>
+              <button className="pill mbtn" style={{ background: "var(--green)", color: "#fff" }}
+                onClick={() => { onPayout(Number(payAmt) || 0, payNote); setPayAmt(""); setPayNote(""); }}>
+                Выдать
+              </button>
+              <button className="pill mbtn" style={{ background: "var(--green-soft, #e8f5e9)", color: "var(--green)" }}
+                onClick={() => { onPayout(kid.available, payNote); setPayAmt(""); setPayNote(""); }}>
+                всё
+              </button>
             </div>
-            <button className="pill payoutbtn" onClick={onPayout}>Выдать доступное на руки</button>
+            <input
+              className="field" type="text" placeholder="за что (необязательно)" maxLength={80}
+              value={payNote} onChange={(e) => setPayNote(e.target.value)}
+              style={{ width: "100%", marginTop: 8 }}
+            />
 
             <div className="log">
               {txs.length === 0 && <p className="empty">Пока пусто.</p>}
               {txs.slice(0, 40).map((e) => (
                 <div className="logrow" key={e.id}>
-                  <span className="logname">{icon(e.type)}{e.label}</span>
+                  <span className="logname">
+                    <span className="small" style={{ opacity: 0.55, marginRight: 6 }}>{fmtDate(e.created_at)}</span>
+                    {icon(e.type)}{e.label}
+                  </span>
                   <span className="num logamt" style={{ color: amtColor(e.type) }}>
                     {e.type === "payout" ? "−" : "+"}{fmt(e.amount)}
                   </span>
@@ -253,11 +302,10 @@ function Settings({
     if (!n) return Promise.resolve();
     return commit(() => supabase.rpc("rename_kid", { p_kid: id, p_name: n }));
   };
-  const correct = (id: string, available: number, savings: number) =>
+  const correct = (id: string, available: number) =>
     commit(() => supabase.rpc("correct_kid", {
       p_kid: id,
       p_available: Math.max(0, Math.floor(available || 0)),
-      p_savings:   Math.max(0, Math.floor(savings   || 0)),
     }));
   const updateAction = (id: string, label: string, amount: number) =>
     commit(() => supabase.rpc("update_action", {
@@ -287,7 +335,7 @@ function Settings({
           <input className="num field" style={{ width: 100 }} type="number" min={0} max={100} step={1}
             defaultValue={Math.round(rate * 100)}
             onBlur={(e) => updateRate(Number(e.target.value) || 0)} />
-          <span className="small">% — применяется к сумме «в росте» каждый понедельник</span>
+          <span className="small">% — применяется к сумме на счёте каждый понедельник</span>
         </div>
 
         <label className="flabel">Имена</label>
@@ -340,22 +388,16 @@ function ActionRow({
 
 function CorrectRow({
   kid, onSave,
-}: { kid: Kid; onSave: (id: string, available: number, savings: number) => void }) {
+}: { kid: Kid; onSave: (id: string, available: number) => void }) {
   const [available, setAvailable] = useState(kid.available);
-  const [savings, setSavings]   = useState(kid.savings);
   return (
     <div className="frow">
       <span style={{ width: 64, fontWeight: 800, fontSize: 14, opacity: 0.7 }}>{kid.name}</span>
-      <span className="small">дост.</span>
+      <span className="small">на счету</span>
       <input className="num field" style={{ textAlign: "center" }} type="number" min={0}
         value={available}
         onChange={(e) => setAvailable(Number(e.target.value) || 0)}
-        onBlur={() => onSave(kid.id, available, savings)} />
-      <span className="small">рост</span>
-      <input className="num field" style={{ textAlign: "center" }} type="number" min={0}
-        value={savings}
-        onChange={(e) => setSavings(Number(e.target.value) || 0)}
-        onBlur={() => onSave(kid.id, available, savings)} />
+        onBlur={() => onSave(kid.id, available)} />
     </div>
   );
 }

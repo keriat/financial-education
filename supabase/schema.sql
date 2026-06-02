@@ -18,17 +18,35 @@ insert into settings (id, rate) values (1, 0.20) on conflict (id) do nothing;
 
 -- ---------- Дети ------------------------------------------------------
 create table if not exists kids (
-  id             uuid primary key default gen_random_uuid(),
-  name           text not null,
-  sort           int  not null default 0,
-  available      int  not null default 0,
-  savings        int  not null default 0,
-  savings_anchor date,
-  created_at     timestamptz not null default now(),
+  id              uuid primary key default gen_random_uuid(),
+  name            text not null,
+  sort            int  not null default 0,
+  available       int  not null default 0,
+  interest_anchor date,
+  created_at      timestamptz not null default now(),
   constraint kids_name_len   check (char_length(name) between 1 and 40),
-  constraint kids_amounts_nn check (available >= 0 and savings >= 0),
-  constraint kids_amounts_cap check (available <= 10000000 and savings <= 10000000)
+  constraint kids_amount_nn  check (available >= 0),
+  constraint kids_amount_cap check (available <= 10000000)
 );
+
+-- Миграция со старой модели (две корзины) на одну.
+-- savings сворачиваем в available, anchor переименовываем.
+do $$ begin
+  if exists (select 1 from information_schema.columns
+             where table_schema='public' and table_name='kids' and column_name='savings_anchor')
+     and not exists (select 1 from information_schema.columns
+             where table_schema='public' and table_name='kids' and column_name='interest_anchor') then
+    alter table kids rename column savings_anchor to interest_anchor;
+  end if;
+end $$;
+
+do $$ begin
+  if exists (select 1 from information_schema.columns
+             where table_schema='public' and table_name='kids' and column_name='savings') then
+    update kids set available = available + savings;
+    alter table kids drop column savings;
+  end if;
+end $$;
 
 -- ---------- За что начисляем ----------------------------------------
 create table if not exists actions (
@@ -41,6 +59,8 @@ create table if not exists actions (
 );
 
 -- ---------- Журнал операций -----------------------------------------
+--  Старые типы 'save'/'unsave' остаются разрешёнными ради истории,
+--  новые операции их не создают.
 create table if not exists transactions (
   id         uuid primary key default gen_random_uuid(),
   kid_id     uuid not null references kids(id) on delete cascade,
@@ -77,69 +97,63 @@ do $$ begin
 end $$;
 
 -- =====================================================================
---  Операции — атомарные функции (только плюсы, ничего не отнимается)
+--  Операции — атомарные функции
 --  Все SECURITY DEFINER, search_path зафиксирован, owner-only грант ниже.
 -- =====================================================================
 
-create or replace function earn(p_kid uuid, p_label text, p_amount int)
+-- Старые функции корзины «в рост» больше не нужны.
+drop function if exists to_savings(uuid, int);
+drop function if exists from_savings(uuid, int);
+
+-- Прежняя сигнатура без даты заменена.
+drop function if exists earn(uuid, text, int);
+
+create or replace function earn(p_kid uuid, p_label text, p_amount int, p_when timestamptz default null)
 returns void language plpgsql security definer set search_path = public as $$
-declare amt int;
+declare amt int; ts timestamptz;
 begin
   if p_kid is null then return; end if;
   amt := cap_amount(coalesce(p_amount, 0), 10000);
   if amt <= 0 then return; end if;
-  update kids set available = available + amt where id = p_kid;
-  insert into transactions(kid_id, type, label, amount)
-  values (p_kid, 'earn', left(coalesce(p_label, ''), 80), amt);
+  ts := coalesce(p_when, now());
+  if ts > now() then ts := now(); end if;
+  if ts < now() - interval '180 days' then ts := now() - interval '180 days'; end if;
+  update kids
+     set available = available + amt,
+         interest_anchor = coalesce(interest_anchor, (date_trunc('week', now()))::date)
+   where id = p_kid;
+  insert into transactions(kid_id, type, label, amount, created_at)
+  values (p_kid, 'earn', left(coalesce(p_label, ''), 80), amt, ts);
 end $$;
 
-create or replace function to_savings(p_kid uuid, p_amount int)
+-- Прежние сигнатуры payout заменены: теперь с комментарием и датой.
+drop function if exists payout(uuid);
+drop function if exists payout(uuid, int);
+
+create or replace function payout(p_kid uuid, p_amount int, p_label text default null, p_when timestamptz default null)
 returns void language plpgsql security definer set search_path = public as $$
-declare amt int;
+declare amt int; bal int; lbl text; ts timestamptz;
 begin
   if p_kid is null then return; end if;
-  select least(cap_amount(coalesce(p_amount, 0), 1000000), available) into amt
-    from kids where id = p_kid;
-  if amt is null or amt <= 0 then return; end if;
+  select available into bal from kids where id = p_kid;
+  if bal is null or bal <= 0 then return; end if;
+  amt := least(cap_amount(coalesce(p_amount, 0), 10000000), bal);
+  if amt <= 0 then return; end if;
+  lbl := btrim(coalesce(p_label, ''));
+  if char_length(lbl) = 0 then lbl := 'Выдано на руки'; end if;
+  if char_length(lbl) > 80 then lbl := left(lbl, 80); end if;
+  ts := coalesce(p_when, now());
+  if ts > now() then ts := now(); end if;
+  if ts < now() - interval '180 days' then ts := now() - interval '180 days'; end if;
   update kids
      set available = available - amt,
-         savings   = savings + amt,
-         savings_anchor = coalesce(savings_anchor, (date_trunc('week', now()))::date)
+         interest_anchor = case when available - amt = 0 then null else interest_anchor end
    where id = p_kid;
-  insert into transactions(kid_id, type, label, amount)
-  values (p_kid, 'save', 'В рост', amt);
+  insert into transactions(kid_id, type, label, amount, created_at)
+  values (p_kid, 'payout', lbl, amt, ts);
 end $$;
 
-create or replace function from_savings(p_kid uuid, p_amount int)
-returns void language plpgsql security definer set search_path = public as $$
-declare amt int;
-begin
-  if p_kid is null then return; end if;
-  select least(cap_amount(coalesce(p_amount, 0), 1000000), savings) into amt
-    from kids where id = p_kid;
-  if amt is null or amt <= 0 then return; end if;
-  update kids
-     set savings = savings - amt,
-         available = available + amt,
-         savings_anchor = case when savings - amt = 0 then null else savings_anchor end
-   where id = p_kid;
-  insert into transactions(kid_id, type, label, amount)
-  values (p_kid, 'unsave', 'Снято в доступные', amt);
-end $$;
-
-create or replace function payout(p_kid uuid)
-returns void language plpgsql security definer set search_path = public as $$
-declare amt int;
-begin
-  if p_kid is null then return; end if;
-  select available into amt from kids where id = p_kid;
-  if amt is null or amt <= 0 then return; end if;
-  update kids set available = 0 where id = p_kid;
-  insert into transactions(kid_id, type, label, amount)
-  values (p_kid, 'payout', 'Выдано на руки', amt);
-end $$;
-
--- Идемпотентное начисление процентов за пропущенные недели.
+-- Идемпотентное начисление процентов за пропущенные недели на available.
 create or replace function apply_interest()
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -153,18 +167,18 @@ declare
 begin
   select rate into r from settings where id = 1;
   if r is null or r <= 0 then return; end if;
-  for k in select id, savings, savings_anchor from kids
-           where savings > 0 and savings_anchor is not null loop
-    weeks := ((cur_monday - k.savings_anchor) / 7);
+  for k in select id, available, interest_anchor from kids
+           where available > 0 and interest_anchor is not null loop
+    weeks := ((cur_monday - k.interest_anchor) / 7);
     if weeks > 0 then
-      s := k.savings;
+      s := k.available;
       for i in 1..weeks loop
         interest := floor(s * r);
         s := s + interest;
         insert into transactions(kid_id, type, label, amount)
         values (k.id, 'interest', 'Проценты за неделю', interest);
       end loop;
-      update kids set savings = s, savings_anchor = cur_monday where id = k.id;
+      update kids set available = s, interest_anchor = cur_monday where id = k.id;
     end if;
   end loop;
 end $$;
@@ -190,22 +204,23 @@ end $$;
 
 -- Ручная коррекция баланса (для редких случаев). Не пишет в историю —
 -- родитель знает, что делает. Сбрасывает anchor, если ушло в 0.
-create or replace function correct_kid(p_kid uuid, p_available int, p_savings int)
+create or replace function correct_kid(p_kid uuid, p_available int)
 returns void language plpgsql security definer set search_path = public as $$
-declare a int; s int;
+declare a int;
 begin
   if p_kid is null then return; end if;
   a := cap_amount(coalesce(p_available, 0), 10000000);
-  s := cap_amount(coalesce(p_savings,   0), 10000000);
   update kids
      set available = a,
-         savings   = s,
-         savings_anchor = case
-           when s = 0 then null
-           when savings_anchor is null then (date_trunc('week', now()))::date
-           else savings_anchor end
+         interest_anchor = case
+           when a = 0 then null
+           when interest_anchor is null then (date_trunc('week', now()))::date
+           else interest_anchor end
    where id = p_kid;
 end $$;
+
+-- Старая сигнатура с двумя корзинами больше не используется.
+drop function if exists correct_kid(uuid, int, int);
 
 create or replace function add_action(p_label text, p_amount int, p_sort int)
 returns uuid language plpgsql security definer set search_path = public as $$
@@ -245,7 +260,7 @@ create or replace function reset_all()
 returns void language plpgsql security definer set search_path = public as $$
 begin
   delete from transactions;
-  update kids set available = 0, savings = 0, savings_anchor = null;
+  update kids set available = 0, interest_anchor = null;
 end $$;
 
 -- =====================================================================
@@ -295,14 +310,12 @@ revoke insert, update, delete on all tables in schema public from authenticated;
 -- EXECUTE только на «белый список» функций
 revoke all on all functions in schema public from authenticated;
 grant execute on function
-  earn(uuid, text, int),
-  to_savings(uuid, int),
-  from_savings(uuid, int),
-  payout(uuid),
+  earn(uuid, text, int, timestamptz),
+  payout(uuid, int, text, timestamptz),
   apply_interest(),
   set_rate(numeric),
   rename_kid(uuid, text),
-  correct_kid(uuid, int, int),
+  correct_kid(uuid, int),
   add_action(text, int, int),
   update_action(uuid, text, int),
   delete_action(uuid),

@@ -15,6 +15,8 @@ input{ font-family:inherit; }
 
 .wrap{ max-width:480px; margin:0 auto; padding:24px 16px 96px; }
 .topbar{ display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:20px; }
+.datebar{ display:flex; align-items:center; gap:10px; padding:10px 14px; margin-bottom:16px; }
+.datebar .pill{ padding:6px 12px; font-size:13px; font-weight:800; background:var(--gold-soft, #fff3cf); color:var(--gold, #b78a00); }
 .h1{ font-size:30px; line-height:1; color:var(--green); }
 .sub{ font-size:14px; font-weight:700; opacity:.6; margin-top:4px; }
 .card{ background:#fff; border-radius:24px;
