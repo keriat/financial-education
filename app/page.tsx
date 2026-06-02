@@ -346,6 +346,11 @@ function Settings({
           </div>
         ))}
 
+        <label className="flabel">Ссылка для ребёнка (только смотреть)</label>
+        {kids.map((k) => (
+          <ShareRow key={k.id} kid={k} reload={reload} />
+        ))}
+
         <label className="flabel">За что начисляем</label>
         {actions.map((a) => (
           <ActionRow key={a.id} action={a} onSave={updateAction} onDelete={() => delAction(a.id)} />
@@ -382,6 +387,37 @@ function ActionRow({
         onChange={(e) => setAmount(Number(e.target.value) || 0)}
         onBlur={() => onSave(action.id, label, amount)} />
       <button className="delbtn" onClick={onDelete}>✕</button>
+    </div>
+  );
+}
+
+function ShareRow({ kid, reload }: { kid: Kid; reload: () => Promise<void> }) {
+  const [origin, setOrigin] = useState("");
+  const [copied, setCopied] = useState(false);
+  useEffect(() => { setOrigin(window.location.origin); }, []);
+  const url = origin ? `${origin}/k?t=${kid.view_token}` : "";
+
+  const copy = async () => {
+    if (!url) return;
+    try { await navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 1200); }
+    catch { /* clipboard может быть запрещён — пользователь скопирует вручную */ }
+  };
+  const rotate = async () => {
+    if (!window.confirm("Старая ссылка перестанет работать. Сделать новую?")) return;
+    await supabase.rpc("rotate_view_token", { p_kid: kid.id });
+    await reload();
+  };
+
+  return (
+    <div className="frow" style={{ flexWrap: "wrap" }}>
+      <span style={{ width: 64, fontWeight: 800, fontSize: 14, opacity: 0.7 }}>{kid.name}</span>
+      <input className="field" type="text" readOnly value={url} onFocus={(e) => e.currentTarget.select()}
+        style={{ flex: 1, minWidth: 140, fontSize: 12 }} />
+      <button className="pill" onClick={copy}
+        style={{ background: "var(--green-soft)", color: "var(--green)", padding: "8px 12px", fontSize: 12, fontWeight: 800 }}>
+        {copied ? "✓" : "копировать"}
+      </button>
+      <button className="delbtn" onClick={rotate} title="новая ссылка">↻</button>
     </div>
   );
 }

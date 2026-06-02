@@ -264,6 +264,76 @@ begin
 end $$;
 
 -- =====================================================================
+--  Публичная ссылка для ребёнка: непредсказуемый токен + read-only RPC.
+--  Токен хранится прямо в kids — родитель его читает (authenticated),
+--  ребёнок передаёт в URL и получает данные через anon-функцию kid_view.
+-- =====================================================================
+do $$ begin
+  if not exists (select 1 from information_schema.columns
+                 where table_schema='public' and table_name='kids' and column_name='view_token') then
+    alter table kids add column view_token text;
+    update kids set view_token = encode(gen_random_bytes(8), 'hex') where view_token is null;
+    alter table kids alter column view_token set not null;
+    alter table kids alter column view_token set default encode(gen_random_bytes(8), 'hex');
+    create unique index kids_view_token_idx on kids(view_token);
+  end if;
+end $$;
+
+-- Возвращает имя, баланс, ставку, всего заработано и историю по токену.
+-- Сам идемпотентно догоняет проценты, чтобы экран ребёнка не отставал.
+create or replace function kid_view(p_token text)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  k_id        uuid;
+  k_name      text;
+  k_available int;
+  r           numeric;
+  earned      int;
+  txs         jsonb;
+begin
+  if p_token is null or char_length(p_token) < 8 or char_length(p_token) > 64 then
+    return null;
+  end if;
+  select id into k_id from kids where view_token = p_token;
+  if k_id is null then return null; end if;
+  perform apply_interest();
+  select name, available into k_name, k_available from kids where id = k_id;
+  select rate into r from settings where id = 1;
+  select coalesce(sum(amount), 0)::int into earned
+    from transactions where kid_id = k_id and type in ('earn','interest');
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id',         t.id,
+    'type',       t.type,
+    'label',      t.label,
+    'amount',     t.amount,
+    'created_at', t.created_at
+  )), '[]'::jsonb) into txs
+  from (
+    select id, type, label, amount, created_at
+    from transactions where kid_id = k_id
+    order by created_at desc limit 40
+  ) t;
+  return jsonb_build_object(
+    'name',         k_name,
+    'available',    k_available,
+    'rate',         r,
+    'earned',       earned,
+    'transactions', txs
+  );
+end $$;
+
+-- Перевыдать ссылку: старая сразу перестаёт работать.
+create or replace function rotate_view_token(p_kid uuid)
+returns text language plpgsql security definer set search_path = public as $$
+declare new_token text;
+begin
+  if p_kid is null then return null; end if;
+  new_token := encode(gen_random_bytes(8), 'hex');
+  update kids set view_token = new_token where id = p_kid;
+  return new_token;
+end $$;
+
+-- =====================================================================
 --  Авто-начисление по понедельникам (необязательно).
 --  Включи расширение: Database → Extensions → pg_cron, потом раскомментируй:
 -- =====================================================================
@@ -302,6 +372,11 @@ revoke all on all tables    in schema public from anon;
 revoke all on all functions in schema public from anon;
 revoke all on all sequences in schema public from anon;
 
+-- Anon (без логина): только одна публичная функция — просмотр по токену.
+-- Таблицы остаются недоступны, RLS не пускает SELECT для anon.
+grant usage on schema public to anon;
+grant execute on function kid_view(text) to anon;
+
 -- Authenticated: только SELECT на таблицах + EXECUTE на функциях.
 grant usage on schema public to authenticated;
 grant select on all tables in schema public to authenticated;
@@ -319,5 +394,6 @@ grant execute on function
   add_action(text, int, int),
   update_action(uuid, text, int),
   delete_action(uuid),
-  reset_all()
+  reset_all(),
+  rotate_view_token(uuid)
 to authenticated;

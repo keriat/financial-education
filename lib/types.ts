@@ -4,6 +4,7 @@ export type Kid = {
   sort: number;
   available: number;
   interest_anchor: string | null;
+  view_token: string;
 };
 
 export type Action = {
